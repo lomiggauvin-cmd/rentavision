@@ -1,15 +1,17 @@
 "use client";
 
-import { useState, useMemo, useRef, useCallback } from "react";
+import { useState, useMemo, useRef, useCallback, useEffect } from "react";
 import {
   AnalysisResult,
   ScenarioResult,
   recalculateWithFees,
   ShortTermFees,
+  getSeasonalityMatrix,
 } from "@/lib/taxCalculator";
 import { calculate15YearProjection, ProjectionResult } from "@/lib/projectionEngine";
 import Link from "next/link";
 import dynamic from "next/dynamic";
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Area, AreaChart } from "recharts";
 
 // Dynamically import the chart component to avoid SSR hydration issues with Recharts
 const ProjectionChart = dynamic(() => import("@/components/ProjectionChart"), { ssr: false });
@@ -38,17 +40,110 @@ export default function DashboardResults({ result, onReset }: Props) {
   // ─── Interactive fee state ───────────────────────────
   const [conciergeFee, setConciergeFee] = useState(20);
   const [cleaningFeePerStay, setCleaningFeePerStay] = useState(40);
-  const [averageStayLength, setAverageStayLength] = useState(3);
+  const [personalUseMonths, setPersonalUseMonths] = useState<number[]>([]);
 
   const dashboardRef = useRef<HTMLDivElement>(null);
 
+  // Fixed average stay length (no slider)
+  const averageStayLength = 3;
+
+  // ─── Seasonality Matrix ───────────────────────────────
+  const seasonalityMatrix = useMemo(() => {
+    return [
+      { name: "Jan", multiplier: 0.5, days: 31, occupationRate: 0.50 },   // Basse saison
+      { name: "Fév", multiplier: 0.6, days: 28, occupationRate: 0.50 },   // Basse saison
+      { name: "Mar", multiplier: 0.8, days: 31, occupationRate: 0.60 },   // Moyenne saison
+      { name: "Avr", multiplier: 0.9, days: 30, occupationRate: 0.65 },   // Moyenne saison
+      { name: "Mai", multiplier: 1.1, days: 31, occupationRate: 0.75 },   // Haute saison
+      { name: "Jun", multiplier: 1.2, days: 30, occupationRate: 0.80 },   // Haute saison
+      { name: "Jul", multiplier: 1.5, days: 31, occupationRate: 0.90 },   // Très haute saison
+      { name: "Aoû", multiplier: 1.5, days: 31, occupationRate: 0.90 },   // Très haute saison
+      { name: "Sep", multiplier: 1.0, days: 30, occupationRate: 0.70 },   // Moyenne saison
+      { name: "Oct", multiplier: 0.8, days: 31, occupationRate: 0.65 },   // Moyenne saison
+      { name: "Nov", multiplier: 0.5, days: 30, occupationRate: 0.45 },   // Basse saison
+      { name: "Déc", multiplier: 0.7, days: 31, occupationRate: 0.55 },   // Basse saison
+    ];
+  }, []);
+
   // ─── Real-time recalculation (no API call) ──────────
   const adjustedResult = useMemo(() => {
-    const fees: ShortTermFees = { conciergeFee, cleaningFeePerStay, averageStayLength };
+    const fees: ShortTermFees = { 
+      conciergeFee, 
+      cleaningFeePerStay, 
+      averageStayLength,
+      personalUseMonths 
+    };
     return recalculateWithFees(result, fees);
-  }, [result, conciergeFee, cleaningFeePerStay, averageStayLength]);
+  }, [result, conciergeFee, cleaningFeePerStay, personalUseMonths]);
 
   const { scenarios, meilleurScenario, inputs, marketLong, marketShort, trancheTMI, partsFiscales, recommendation } = adjustedResult;
+
+  // ─── Vacation Impact Calculation ───────────────────────
+  const vacationImpact = useMemo(() => {
+    const adr = marketShort?.adr || 80;
+    const occupancyRate = marketShort?.tauxOccupationAnnuel || 0.7;
+    
+    let totalAnnualRevenue = 0;
+    let totalAvailableNights = 0;
+    
+    seasonalityMatrix.forEach((month, index) => {
+      const isPersonalUse = personalUseMonths.includes(index);
+      const monthNights = Math.round(month.days * occupancyRate);
+      const monthRevenue = isPersonalUse ? 0 : (adr * month.multiplier * monthNights);
+      
+      totalAnnualRevenue += monthRevenue;
+      totalAvailableNights += isPersonalUse ? 0 : monthNights;
+    });
+
+    return {
+      totalAnnualRevenue,
+      totalAvailableNights,
+      averageBookingsPerMonth: Math.round(totalAvailableNights / (12 - personalUseMonths.length) / averageStayLength),
+      lostRevenue: personalUseMonths.length > 0 ? 
+        seasonalityMatrix.reduce((acc, month, index) => {
+          if (personalUseMonths.includes(index)) {
+            const adr = marketShort?.adr || 80;
+            const occupancyRate = marketShort?.tauxOccupationAnnuel || 0.7;
+            const monthNights = Math.round(month.days * occupancyRate);
+            return acc + (adr * month.multiplier * monthNights);
+          }
+          return acc;
+        }, 0) : 0
+    };
+  }, [seasonalityMatrix, personalUseMonths, marketShort, averageStayLength]);
+
+  // ─── Student Rental Conflict Detection ───────────────────
+  const hasStudentConflict = useMemo(() => {
+    if (personalUseMonths.length === 0) return false;
+    
+    // Student rental typically runs September to May (months 8-4, wrapping around)
+    const studentMonths = [8, 9, 10, 11, 0, 1, 2, 3, 4]; // Sep-May
+    return personalUseMonths.some(month => studentMonths.includes(month));
+  }, [personalUseMonths]);
+
+  // ─── Long Term Rental Incompatibility Check ───────────────
+  const hasLongTermIncompatibility = personalUseMonths.length > 0;
+
+  // ─── Seasonality Chart Data ───────────────────────────────
+  const seasonalityChartData = useMemo(() => {
+    const adr = marketShort?.adr || 80;
+    
+    return seasonalityMatrix.map((month, index) => {
+      const isPersonalUse = personalUseMonths.includes(index);
+      const monthOccupationRate = month.occupationRate; // Use monthly rate
+      const monthNights = Math.round(month.days * monthOccupationRate);
+      const occupancyPercent = isPersonalUse ? 0 : (monthOccupationRate * 100);
+      const monthlyRevenue = isPersonalUse ? 0 : (adr * month.multiplier * monthNights);
+      
+      return {
+        month: month.name,
+        occupation: Math.round(occupancyPercent),
+        revenus: Math.round(monthlyRevenue),
+        multiplier: month.multiplier,
+        isLocked: isPersonalUse
+      };
+    });
+  }, [seasonalityMatrix, personalUseMonths, marketShort]);
 
   // ─── Helper for routing ─────────────────────────────
   const getCityQuery = (cp: string) => {
@@ -145,6 +240,8 @@ export default function DashboardResults({ result, onReset }: Props) {
             scenario={s}
             isBest={s.type === meilleurScenario.type}
             index={i}
+            hasStudentConflict={s.type === "mixte" && hasStudentConflict}
+            hasLongTermIncompatibility={s.type === "longue" && hasLongTermIncompatibility}
           />
         ))}
       </div>
@@ -157,10 +254,218 @@ export default function DashboardResults({ result, onReset }: Props) {
         setConciergeFee={setConciergeFee}
         cleaningFeePerStay={cleaningFeePerStay}
         setCleaningFeePerStay={setCleaningFeePerStay}
-        averageStayLength={averageStayLength}
-        setAverageStayLength={setAverageStayLength}
         marketShort={marketShort}
       />
+
+      {/* ═══════════════════════════════════════════════════
+          VACATION BRAIN - CERVEAU DES VACANCES
+          ═══════════════════════════════════════════════════ */}
+      <div className="glass overflow-hidden rounded-2xl">
+        <div className="p-6">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h3 className="font-display text-lg font-bold text-white">
+                🧠 Verrouiller vos séjours personnels
+              </h3>
+              <p className="text-xs text-gray-500 mt-1">
+                Sélectionnez les mois où vous utilisez le bien pour ajuster les revenus locatifs
+              </p>
+            </div>
+            {!inputs.meuble && (
+              <div className="flex items-center gap-2 rounded-lg bg-red-500/10 border border-red-500/30 px-3 py-2">
+                <span className="text-lg">🔒</span>
+                <div>
+                  <p className="text-xs font-bold text-red-400">Indisponible en bail nu</p>
+                  <p className="text-[10px] text-red-300">Meublé requis</p>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {inputs.meuble ? (
+            <>
+              {/* Month Grid */}
+              <div className="grid grid-cols-6 gap-2 mb-4">
+                {seasonalityMatrix.map((month, index) => {
+                  const isLocked = personalUseMonths.includes(index);
+                  const seasonColor = month.multiplier >= 1.2 ? "bg-red-500/20 text-red-300 border-red-500/30" :
+                                    month.multiplier <= 0.7 ? "bg-blue-500/20 text-blue-300 border-blue-500/30" :
+                                    "bg-green-500/20 text-green-300 border-green-500/30";
+                  
+                  return (
+                    <button
+                      key={month.name}
+                      type="button"
+                      onClick={() => {
+                        if (isLocked) {
+                          setPersonalUseMonths(personalUseMonths.filter(m => m !== index));
+                        } else {
+                          setPersonalUseMonths([...personalUseMonths, index]);
+                        }
+                      }}
+                      disabled={!inputs.meuble}
+                      className={`rounded-lg px-3 py-2 text-xs font-medium transition-all duration-200 border ${
+                        isLocked
+                          ? "bg-red-500/30 text-red-400 border-red-500/50"
+                          : seasonColor
+                      } ${!inputs.meuble ? "opacity-50 cursor-not-allowed" : "hover:scale-105"}`}
+                    >
+                      <div>{month.name}</div>
+                      <div className="text-[10px] opacity-75">
+                        {month.multiplier >= 1.2 ? "🔥" : month.multiplier <= 0.7 ? "❄️" : "🌤️"}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+
+              {/* Student Conflict Warning */}
+              {hasStudentConflict && (
+                <div className="mb-4 rounded-lg bg-orange-400/10 border border-orange-400/30 p-3">
+                  <div className="flex items-start gap-2">
+                    <span className="text-orange-400">⚠️</span>
+                    <div>
+                      <p className="text-xs font-bold text-orange-300">Conflit avec stratégie étudiante</p>
+                      <p className="text-[10px] text-orange-200 mt-1">
+                        Certains mois verrouillés chevauchent la période de location étudiante (Sept-Mai) dans la stratégie mixte
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Impact Summary */}
+              {personalUseMonths.length > 0 && (
+                <div className="rounded-lg bg-white/[0.03] border border-white/[0.06] p-4">
+                  <p className="text-[10px] font-bold uppercase tracking-widest text-gray-500 mb-3">
+                    Impact de vos séjours personnels
+                  </p>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <p className="text-xs text-gray-400">Mois verrouillés</p>
+                      <p className="text-lg font-bold text-red-400">{personalUseMonths.length}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-gray-400">Revenus perdus/an</p>
+                      <p className="text-lg font-bold text-orange-400">{fmt(vacationImpact.lostRevenue)}</p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Daily Activity Estimation */}
+              <div className="mt-4 rounded-lg bg-white/[0.03] border border-white/[0.06] p-4">
+                <p className="text-[10px] font-bold uppercase tracking-widest text-gray-500 mb-3">
+                  🏠 Votre quotidien d'hôte
+                </p>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <p className="text-xs text-gray-400">Réservations/mois</p>
+                    <p className="text-lg font-bold text-emerald-400">{vacationImpact.averageBookingsPerMonth}</p>
+                  </div>
+                  <div>
+                    <p className="text-xs text-gray-400">Revenu ajusté/an</p>
+                    <p className="text-lg font-bold text-purple-400">{fmt(vacationImpact.totalAnnualRevenue)}</p>
+                  </div>
+                </div>
+              </div>
+            </>
+          ) : (
+            <div className="text-center py-8">
+              <div className="text-4xl mb-3">🔒</div>
+              <p className="text-gray-400">Le calendrier des vacances n'est disponible que pour les locations meublées</p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ═══════════════════════════════════════════════════
+          SEASONALITY CHART
+          ═══════════════════════════════════════════════════ */}
+      <div className="glass overflow-hidden rounded-2xl">
+        <div className="p-6">
+          <div className="mb-4">
+            <h3 className="font-display text-lg font-bold text-white mb-2">
+              📊 Saisonnalité et Revenus Mensuels
+            </h3>
+            <p className="text-xs text-gray-500">
+              Visualisation de l'occupation et des revenus estimés sur l'année
+            </p>
+          </div>
+
+          {/* Seasonality Chart */}
+          <div className="h-[300px] w-full">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={seasonalityChartData}>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(255,255,255,0.1)" />
+                <XAxis 
+                  dataKey="month" 
+                  stroke="#9CA3AF"
+                  tick={{ fill: '#9CA3AF', fontSize: 12 }}
+                />
+                <YAxis 
+                  yAxisId="occupation"
+                  orientation="left"
+                  stroke="#60A5FA"
+                  tick={{ fill: '#60A5FA', fontSize: 12 }}
+                  label={{ value: 'Taux occupation (%)', angle: -90, position: 'insideLeft', fill: '#60A5FA' }}
+                />
+                <YAxis 
+                  yAxisId="revenus"
+                  orientation="right"
+                  stroke="#34D399"
+                  tick={{ fill: '#34D399', fontSize: 12 }}
+                  label={{ value: 'Revenus (€)', angle: 90, position: 'insideRight', fill: '#34D399' }}
+                />
+                <Tooltip
+                  contentStyle={{
+                    backgroundColor: 'rgba(17, 24, 39, 0.9)',
+                    border: '1px solid rgba(255, 255, 255, 0.1)',
+                    borderRadius: '8px',
+                    color: '#fff'
+                  }}
+                  formatter={(value: number, name: string) => [
+                    name === 'occupation' ? `${value}%` : fmt(value),
+                    name === 'occupation' ? 'Taux occupation' : 'Revenus mensuels'
+                  ]}
+                />
+                <Bar 
+                  yAxisId="occupation"
+                  dataKey="occupation" 
+                  fill="#60A5FA" 
+                  name="occupation"
+                  radius={[4, 4, 0, 0]}
+                />
+                <Bar 
+                  yAxisId="revenus"
+                  dataKey="revenus" 
+                  fill="#34D399" 
+                  name="revenus"
+                  radius={[4, 4, 0, 0]}
+                />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+
+          {/* Chart Legend */}
+          <div className="mt-4 flex items-center justify-center gap-6 text-xs">
+            <div className="flex items-center gap-2">
+              <div className="w-3 h-3 bg-blue-400 rounded"></div>
+              <span className="text-gray-400">Taux occupation</span>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="w-3 h-3 bg-emerald-400 rounded"></div>
+              <span className="text-gray-400">Revenus mensuels</span>
+            </div>
+            {personalUseMonths.length > 0 && (
+              <div className="flex items-center gap-2">
+                <div className="w-3 h-3 bg-red-400 rounded"></div>
+                <span className="text-gray-400">Mois verrouillés</span>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
 
       {/* Comparison Table */}
       <div className="glass overflow-hidden rounded-2xl">
@@ -367,16 +672,12 @@ function FeeAdjustmentPanel({
   setConciergeFee,
   cleaningFeePerStay,
   setCleaningFeePerStay,
-  averageStayLength,
-  setAverageStayLength,
   marketShort,
 }: {
   conciergeFee: number;
   setConciergeFee: (v: number) => void;
   cleaningFeePerStay: number;
   setCleaningFeePerStay: (v: number) => void;
-  averageStayLength: number;
-  setAverageStayLength: (v: number) => void;
   marketShort: { adr: number; tauxOccupationAnnuel: number };
 }) {
   const [isOpen, setIsOpen] = useState(true);
@@ -384,6 +685,7 @@ function FeeAdjustmentPanel({
   // Live preview values
   const revenuBrut = marketShort.adr * 365 * marketShort.tauxOccupationAnnuel;
   const coutConciergerie = revenuBrut * (conciergeFee / 100);
+  const averageStayLength = 3; // Fixed value
   const nbSejours = Math.round((365 * marketShort.tauxOccupationAnnuel) / averageStayLength);
   const coutMenage = nbSejours * cleaningFeePerStay;
 
@@ -460,20 +762,7 @@ function FeeAdjustmentPanel({
             />
 
             {/* Durée moyenne séjour */}
-            <SliderControl
-              id="stayLength"
-              label="Durée moyenne séjour"
-              value={averageStayLength}
-              onChange={setAverageStayLength}
-              min={1}
-              max={14}
-              step={0.5}
-              unit=" nuits"
-              icon="🌙"
-              hint={averageStayLength <= 2 ? "Tourisme express" : averageStayLength <= 4 ? "Weekend / City trip" : averageStayLength <= 7 ? "Semaine" : "Long séjour"}
-              accentColor="orange"
-            />
-          </div>
+            </div>
 
           {/* Live impact summary */}
           <div className="rounded-xl bg-white/[0.03] border border-white/[0.06] p-4">
@@ -635,10 +924,14 @@ function ScenarioCard({
   scenario: s,
   isBest,
   index,
+  hasStudentConflict,
+  hasLongTermIncompatibility,
 }: {
   scenario: ScenarioResult;
   isBest: boolean;
   index: number;
+  hasStudentConflict?: boolean;
+  hasLongTermIncompatibility?: boolean;
 }) {
   const accentBar = ["accent-bar-longue", "accent-bar-courte", "accent-bar-mixte"][index];
   const cfPositive = s.cashflowNetMensuel >= 0;
@@ -646,8 +939,11 @@ function ScenarioCard({
 
   return (
     <div
-      className={`glass relative overflow-hidden rounded-2xl transition-all duration-300 hover:-translate-y-1 hover:shadow-xl
-        ${isBest ? "ring-1 ring-emerald-400/30 shadow-lg shadow-emerald-400/[0.08]" : ""}`}
+      className={`glass relative overflow-hidden rounded-2xl transition-all duration-300 ${
+        hasLongTermIncompatibility 
+          ? "opacity-50 grayscale cursor-not-allowed" 
+          : "hover:-translate-y-1 hover:shadow-xl"
+      } ${isBest && !hasLongTermIncompatibility ? "ring-1 ring-emerald-400/30 shadow-lg shadow-emerald-400/[0.08]" : ""}`}
       style={{ animationDelay: `${index * 0.1}s` }}
     >
       {/* Top accent bar */}
@@ -701,6 +997,36 @@ function ScenarioCard({
                 {alert.message}
               </div>
             ))}
+          </div>
+        )}
+
+        {/* Student Conflict Alert */}
+        {hasStudentConflict && (
+          <div className="mb-4 rounded-lg bg-orange-400/10 border border-orange-400/30 p-3">
+            <div className="flex items-start gap-2">
+              <span className="text-orange-400 text-sm">⚠️</span>
+              <div>
+                <p className="text-xs font-bold text-orange-300">Conflit avec vos vacances</p>
+                <p className="text-[10px] text-orange-200 mt-1">
+                  Certains mois verrouillés chevauchent la période de location étudiante (Sept-Mai)
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Long Term Rental Incompatibility Alert */}
+        {hasLongTermIncompatibility && (
+          <div className="mb-4 rounded-lg bg-red-500/10 border border-red-500/30 p-3">
+            <div className="flex items-start gap-2">
+              <span className="text-red-400 text-sm">🛑</span>
+              <div>
+                <p className="text-xs font-bold text-red-300">Incompatible avec vos séjours</p>
+                <p className="text-[10px] text-red-200 mt-1">
+                  La location longue durée (bail 1 an) ne permet pas vos séjours personnels
+                </p>
+              </div>
+            </div>
           </div>
         )}
 

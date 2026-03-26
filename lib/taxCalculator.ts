@@ -725,11 +725,226 @@ export interface ShortTermFees {
   conciergeFee: number;
   cleaningFeePerStay: number;
   averageStayLength: number;
+  personalUseMonths?: number[];
 }
 
-// End of file
-  const scenarios = [scenarioLD, scenarioCD, scenarioMixte];
-  const meilleur = scenarios.reduce((best, s) => s.cashflowNetMensuel > best.cashflowNetMensuel ? s : best);
+/**
+ * Seasonality matrix for short-term rental pricing
+ */
+export interface SeasonalityMonth {
+  name: string;
+  multiplier: number;
+  days: number;
+  occupationRate: number; // Monthly occupation rate
+}
 
-  return { ...baseResult, scenarios, meilleurScenario: meilleur };
+export function getSeasonalityMatrix(): SeasonalityMonth[] {
+  return [
+    { name: "Jan", multiplier: 0.5, days: 31, occupationRate: 0.50 },   // Basse saison
+    { name: "Fév", multiplier: 0.6, days: 28, occupationRate: 0.50 },   // Basse saison
+    { name: "Mar", multiplier: 0.8, days: 31, occupationRate: 0.60 },   // Moyenne saison
+    { name: "Avr", multiplier: 0.9, days: 30, occupationRate: 0.65 },   // Moyenne saison
+    { name: "Mai", multiplier: 1.1, days: 31, occupationRate: 0.75 },   // Haute saison
+    { name: "Jun", multiplier: 1.2, days: 30, occupationRate: 0.80 },   // Haute saison
+    { name: "Jul", multiplier: 1.5, days: 31, occupationRate: 0.90 },   // Très haute saison
+    { name: "Aoû", multiplier: 1.5, days: 31, occupationRate: 0.90 },   // Très haute saison
+    { name: "Sep", multiplier: 1.0, days: 30, occupationRate: 0.70 },   // Moyenne saison
+    { name: "Oct", multiplier: 0.8, days: 31, occupationRate: 0.65 },   // Moyenne saison
+    { name: "Nov", multiplier: 0.5, days: 30, occupationRate: 0.45 },   // Basse saison
+    { name: "Déc", multiplier: 0.7, days: 31, occupationRate: 0.55 },   // Basse saison
+  ];
+}
+
+/**
+ * Recalculates analysis with adjusted fees for short-term rental
+ */
+export function recalculateWithFees(result: AnalysisResult, fees: ShortTermFees): AnalysisResult {
+  // If no personal use months, return original result
+  if (!fees.personalUseMonths || fees.personalUseMonths.length === 0) {
+    return result;
+  }
+
+  // Create a deep copy of the result to modify
+  const adjustedResult = JSON.parse(JSON.stringify(result));
+
+  // Get seasonality matrix with fallbacks
+  const seasonalityMatrix = getSeasonalityMatrix();
+  
+  // Secure market data with fallbacks
+  const marketADR = Number(result.marketShort?.adr) || 80;
+  const occupancyRate = Number(result.marketShort?.tauxOccupationAnnuel) || 0.7;
+  
+  // Adjust short-term and mixed scenarios based on personal use months
+  adjustedResult.scenarios = adjustedResult.scenarios.map((scenario: ScenarioResult) => {
+    // Disqualify long-term rental if personal use months exist
+    if (scenario.type === "longue" && fees.personalUseMonths && fees.personalUseMonths.length > 0) {
+      // Force all values to 0 to disqualify from being "best"
+      scenario.revenuBrutAnnuel = 0;
+      scenario.revenuBrutMensuel = 0;
+      scenario.chargesAnnuelles = 0;
+      scenario.chargesMensuelles = 0;
+      scenario.cashflowNetAnnuel = -999999; // Very negative to ensure it's never best
+      scenario.cashflowNetMensuel = -999999;
+      scenario.rendementBrut = 0;
+      scenario.rendementNet = -100;
+      scenario.fiscaliteAnnuelle = 0;
+      scenario.fiscaliteMensuelle = 0;
+      
+      // Update regimes to 0 as well
+      if (scenario.regimes && Array.isArray(scenario.regimes)) {
+        scenario.regimes = scenario.regimes.map((regime: any) => ({
+          ...regime,
+          taxableRevenue: 0,
+          impot: 0,
+          prelevementsSociaux: 0,
+          totalFiscalite: 0
+        }));
+      }
+      
+      if (scenario.regimeOptimal) {
+        scenario.regimeOptimal = {
+          ...scenario.regimeOptimal,
+          totalFiscalite: 0
+        };
+      }
+      
+      return scenario;
+    }
+    
+    // Only affect short-term and mixed scenarios
+    if (scenario.type === "courte" || scenario.type === "mixte") {
+      const originalRevenue = Number(scenario.revenuBrutAnnuel) || 0;
+      
+      // Calculate revenue loss from personal use months with full safety
+      let lostRevenue = 0;
+      
+      if (fees.personalUseMonths && Array.isArray(fees.personalUseMonths)) {
+        fees.personalUseMonths.forEach((monthIndex: number) => {
+          if (typeof monthIndex === 'number' && monthIndex >= 0 && monthIndex < 12) {
+            const month = seasonalityMatrix[monthIndex];
+            if (month && typeof month.multiplier === 'number' && typeof month.days === 'number' && typeof month.occupationRate === 'number') {
+              // Use monthly occupation rate instead of global rate
+              const monthOccupationRate = month.occupationRate;
+              const monthNights = Math.round(Number(month.days) * monthOccupationRate);
+              const monthRevenue = marketADR * Number(month.multiplier) * monthNights;
+              lostRevenue += Number(monthRevenue) || 0;
+            }
+          }
+        });
+      }
+
+      // Adjust revenue and all dependent calculations with safety checks
+      const newRevenue = Math.max(0, (originalRevenue - lostRevenue) || 0);
+      const revenueRatio = originalRevenue > 0 ? newRevenue / originalRevenue : 0;
+      
+      // Scale all revenue-dependent values safely
+      scenario.revenuBrutAnnuel = Math.round(newRevenue * 100) / 100;
+      scenario.revenuBrutMensuel = Math.round((newRevenue / 12) * 100) / 100;
+      
+      // Adjust charges (some scale with revenue) with safety
+      const originalCharges = Number(scenario.chargesAnnuelles) || 0;
+      scenario.chargesAnnuelles = Math.round((originalCharges * revenueRatio) * 100) / 100;
+      scenario.chargesMensuelles = Math.round((scenario.chargesAnnuelles / 12) * 100) / 100;
+      
+      // Recalculate tax for each regime with proper fiscal calculation
+      if (scenario.regimes && Array.isArray(scenario.regimes)) {
+        scenario.regimes = scenario.regimes.map((regime: any) => {
+          const abattement = Number(regime.abattement) || 0;
+          const newTaxableRevenue = Math.max(0, (newRevenue - scenario.chargesAnnuelles - abattement) || 0);
+          
+          // Calculate fiscalité correctly - not proportional scaling
+          let impot = 0;
+          let prelevementsSociaux = 0;
+          
+          if (newTaxableRevenue > 0) {
+            // Prélèvements sociaux (17.2%)
+            prelevementsSociaux = newTaxableRevenue * 0.172;
+            
+            // Calcul IR progressif avec tranches marginales
+            const userIncome = Number(result.inputs.revenuAnnuel) || 0;
+            const partsFiscales = Number(result.partsFiscales) || 1; // Use result.partsFiscales instead
+            const taxableIncome = userIncome + newTaxableRevenue;
+            const taxablePerPart = taxableIncome / partsFiscales;
+            
+            // Tranches marginales 2024
+            const tranches = [
+              { limite: 10777, taux: 0 },
+              { limite: 27478, taux: 0.11 },
+              { limite: 78570, taux: 0.30 },
+              { limite: 177139, taux: 0.41 },
+              { limite: Infinity, taux: 0.45 }
+            ];
+            
+            let impotPerPart = 0;
+            let remaining = taxablePerPart;
+            let previousLimite = 0;
+            
+            for (const tranche of tranches) {
+              if (remaining > 0) {
+                const taxableInTranche = Math.min(remaining, tranche.limite - previousLimite);
+                impotPerPart += taxableInTranche * tranche.taux;
+                remaining -= taxableInTranche;
+                previousLimite = tranche.limite;
+              }
+            }
+            
+            impot = impotPerPart * partsFiscales;
+            
+            // Plafonnement à 77% (pas plus de 77% des revenus en impôts)
+            const totalFiscal = impot + prelevementsSociaux;
+            if (totalFiscal > newTaxableRevenue * 0.77) {
+              const reduction = totalFiscal - (newTaxableRevenue * 0.77);
+              impot = Math.max(0, impot - reduction);
+            }
+          }
+          
+          const totalFiscalite = impot + prelevementsSociaux;
+          
+          return {
+            ...regime,
+            taxableRevenue: Math.round(newTaxableRevenue * 100) / 100,
+            impot: Math.round(impot * 100) / 100,
+            prelevementsSociaux: Math.round(prelevementsSociaux * 100) / 100,
+            totalFiscalite: Math.round(totalFiscalite * 100) / 100
+          };
+        });
+      }
+      
+      // Update optimal regime with safety
+      if (scenario.regimes && Array.isArray(scenario.regimes)) {
+        scenario.regimeOptimal = scenario.regimes.reduce((best: any, current: any) => {
+          const bestTotal = Number(best.totalFiscalite) || Infinity;
+          const currentTotal = Number(current.totalFiscalite) || Infinity;
+          return currentTotal < bestTotal ? current : best;
+        }, scenario.regimes[0] || {});
+      }
+      
+      // Recalculate final values with safety
+      const fiscaliteAnnuelle = Number(scenario.regimeOptimal?.totalFiscalite) || 0;
+      scenario.fiscaliteAnnuelle = Math.round(fiscaliteAnnuelle * 100) / 100;
+      scenario.fiscaliteMensuelle = Math.round((fiscaliteAnnuelle / 12) * 100) / 100;
+      
+      const creditAnnuel = Number(result.inputs.mensualiteCredit) * 12 || 0;
+      scenario.cashflowNetAnnuel = Math.round((newRevenue - scenario.chargesAnnuelles - creditAnnuel - fiscaliteAnnuelle) * 100) / 100;
+      scenario.cashflowNetMensuel = Math.round((scenario.cashflowNetAnnuel / 12) * 100) / 100;
+      
+      // Recalculate yields with safety
+      const propertyValue = Number(result.inputs.propertyValue) || (Number(result.inputs.surface) * 3000) || 300000;
+      scenario.rendementBrut = Math.round(((newRevenue / propertyValue) * 100) * 100) / 100;
+      scenario.rendementNet = Math.round(((scenario.cashflowNetAnnuel / propertyValue) * 100) * 100) / 100;
+    }
+    
+    return scenario;
+  });
+
+  // Update the best scenario with safety
+  if (adjustedResult.scenarios && Array.isArray(adjustedResult.scenarios)) {
+    adjustedResult.meilleurScenario = adjustedResult.scenarios.reduce((best: ScenarioResult, current: ScenarioResult) => {
+      const bestCashflow = Number(best.cashflowNetMensuel) || -Infinity;
+      const currentCashflow = Number(current.cashflowNetMensuel) || -Infinity;
+      return currentCashflow > bestCashflow ? current : best;
+    }, adjustedResult.scenarios[0] || adjustedResult.scenarios[0]);
+  }
+
+  return adjustedResult;
 }
